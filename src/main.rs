@@ -1,9 +1,34 @@
+use std::error::Error;
+use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use ulid::Ulid;
 
-const TIME_QUANTUM: u64 = 500; 
+const TIME_QUANTUM: u64 = 500;
+
+#[derive(Debug, PartialEq, Copy, Clone)]
+enum ExitStatus {
+    Pending,
+    Terminated(ExitCode),
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
+enum ExitCode {
+    Success,
+    Failure,
+    From(i32),
+}
+
+impl std::fmt::Display for ExitCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExitCode::Success => write!(f, "0"),
+            ExitCode::Failure => write!(f, "1"),
+            ExitCode::From(code) => write!(f, "{}", code),
+        }
+    }
+}
 
 #[derive(Debug, PartialEq)]
 enum ProcessState {
@@ -22,57 +47,164 @@ enum ProcessSpace {
 
 struct Task {
     id: Ulid,
+    path_to_binary: String,
+    args: Option<Vec<String>>,
     duration: u64,
     state: ProcessState,
     priority: u8,
     space: ProcessSpace,
-    aged: bool,
+    exit_code: Option<ExitCode>,
 }
 
 impl Task {
-    fn new(duration: u64, space: ProcessSpace, priority: u8) -> Self {
+    fn new(
+        path_to_binary: &str,
+        args: Option<Vec<String>>,
+        space: ProcessSpace,
+        priority: u8,
+    ) -> Self {
         Self {
             id: Ulid::new(),
-            duration,
+            path_to_binary: path_to_binary.to_owned(),
+            args,
+            duration: 0,
             state: ProcessState::New,
             priority,
             space,
-            aged: false,
+            exit_code: None,
         }
     }
 
-    fn run(&mut self, quantum: u64, tx: mpsc::Sender<usize>) {
+    fn run(&mut self, quantum: u64, tx: mpsc::Sender<ExitStatus>) {
         self.state = ProcessState::Running;
-        println!("PID: {} transitioned to {:?}", self.id, self.state);
+        print_state(self.id, &self.state, self.exit_code, self.duration, None);
 
         let run_time = std::cmp::min(self.duration, quantum);
         self.duration -= run_time;
 
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(run_time));
-            tx.send(run_time as usize).unwrap();
-        });
-        
-        if self.duration == 0 {
+        let start_time = Instant::now();
+
+        let mut command = Command::new(&self.path_to_binary);
+
+        if let Some(arguments) = &self.args {
+            command.args(arguments);
+        }
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                let elapsed = start_time.elapsed();
+                self.duration += elapsed.as_millis() as u64;
+                self.exit_code = Some(ExitCode::Failure);
+                self.state = ProcessState::Terminated;
+                print_state(
+                    self.id,
+                    &self.state,
+                    self.exit_code,
+                    self.duration,
+                    Some(&err),
+                );
+
+                tx.send(ExitStatus::Terminated(ExitCode::Failure)).unwrap();
+                return;
+            }
+        };
+        let exit_status = match child.wait() {
+            Ok(exit_status) => exit_status,
+            Err(err) => {
+                let elapsed = start_time.elapsed();
+                self.duration += elapsed.as_millis() as u64;
+                self.exit_code = Some(ExitCode::Failure);
+                self.state = ProcessState::Terminated;
+                print_state(
+                    self.id,
+                    &self.state,
+                    self.exit_code,
+                    self.duration,
+                    Some(&err),
+                );
+
+                tx.send(ExitStatus::Terminated(ExitCode::Failure)).unwrap();
+                return;
+            }
+        };
+
+        let elapsed = start_time.elapsed();
+        self.duration += elapsed.as_millis() as u64;
+
+        tx.send(ExitStatus::Terminated(ExitCode::Success)).unwrap();
+
+        if exit_status.success() {
+            self.exit_code = Some(ExitCode::Success);
             self.state = ProcessState::Terminated;
-            println!("PID: {} transitioned to {:?}", self.id, self.state);
+            print_state(self.id, &self.state, self.exit_code, self.duration, None);
         } else {
             self.state = ProcessState::Waiting;
-            self.aged = true;
-            println!("PID: {} transitioned to {:?}", self.id, self.state);
+            print_state(self.id, &self.state, self.exit_code, self.duration, None);
         }
     }
 }
 
-fn dispatcher(tasks: &mut Vec<Task>, tx: &mpsc::Sender<usize>) {
+fn print_state(
+    id: Ulid,
+    state: &ProcessState,
+    exit_code: Option<ExitCode>,
+    duration: u64,
+    err: Option<&dyn Error>,
+) {
+    if *state == ProcessState::Ready || *state == ProcessState::Running {
+        println!(
+            "------------------------------------------\n\
+             PID:            {}\n\
+             State:          {:?}\n\
+             ------------------------------------------",
+            id, state,
+        );
+        return;
+    }
+
+    let exit_code_str = exit_code
+        .as_ref()
+        .map_or("-".to_string(), |e| e.to_string());
+
+    if let Some(ref err) = err {
+        println!(
+            "------------------------------------------\n\
+             PID:            {}\n\
+             State:          {:?}\n\
+             Exit Code:      {}\n\
+             Error Message:  {}\n\
+             ------------------------------------------",
+            id, state, exit_code_str, err
+        );
+    } else {
+        println!(
+            "------------------------------------------\n\
+             PID:            {}\n\
+             State:          {:?}\n\
+             Exit Code:      {}\n\
+             Duration:       {}ms\n\
+             ------------------------------------------",
+            id, state, exit_code_str, duration,
+        );
+    };
+}
+fn dispatcher(tasks: &mut Vec<Task>, tx: &mpsc::Sender<ExitStatus>) {
     for task in &mut *tasks {
-        if task.aged && task.state == ProcessState::Waiting {
+        if task.state == ProcessState::Waiting {
             task.state = ProcessState::Ready;
         }
     }
 
-    if let Some(task) = tasks.iter_mut().filter(|t| t.state == ProcessState::Ready).min_by_key(|t| t.priority) {
-        println!("Dispatcher selected PID: {} with priority: {}", task.id, task.priority);
+    if let Some(task) = tasks
+        .iter_mut()
+        .filter(|t| t.state == ProcessState::Ready)
+        .min_by_key(|t| t.priority)
+    {
+        println!(
+            "Dispatcher selected PID: {} with priority: {}",
+            task.id, task.priority
+        );
         task.run(TIME_QUANTUM, mpsc::Sender::clone(tx));
     }
 }
@@ -81,17 +213,29 @@ fn main() {
     let (tx, rx) = mpsc::channel();
 
     let mut tasks = vec![
-        Task::new(100, ProcessSpace::Kernal, 3),
-        Task::new(600, ProcessSpace::User, 1),
-        Task::new(300, ProcessSpace::User, 2),
-        Task::new(800, ProcessSpace::Kernal, 5),
-        Task::new(50, ProcessSpace::User, 4),
+        Task::new("/bin/ls", None, ProcessSpace::Kernal, 3),
+        Task::new(
+            "/bin/cat",
+            Some(Vec::from([String::from("src/main.rs")])),
+            ProcessSpace::User,
+            1,
+        ),
+        Task::new(
+            "/bin/echo",
+            Some(Vec::from([String::from("Howdy Y'all!")])),
+            ProcessSpace::User,
+            2,
+        ),
+        Task::new("/bin/ls", None, ProcessSpace::Kernal, 5),
+        Task::new("/bad/path/to/ls", None, ProcessSpace::User, 4),
     ];
-   
+
     for task in &mut tasks {
-        println!("Created PID: {} with priority: {}, duration: {}ms, in space: {:?}", task.id, task.priority, task.duration, task.space);
+        println!(
+            "Created PID: {} with priority: {} in space: {:?}",
+            task.id, task.priority, task.space
+        );
         task.state = ProcessState::Ready;
-        println!("PID: {} transitioned to {:?}", task.id, task.state);
     }
 
     loop {
@@ -99,7 +243,7 @@ fn main() {
 
         for task in &tasks {
             if task.state != ProcessState::Terminated {
-                println!("PID: {} is currently in state: {:?}", task.id, task.state);
+                print_state(task.id, &task.state, task.exit_code, task.duration, None);
                 all_done = false;
             }
         }
