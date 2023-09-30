@@ -3,7 +3,7 @@ use std::error::Error;
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 use ulid::Ulid;
 
 const TIME_QUANTUM: u64 = 150;
@@ -49,11 +49,12 @@ struct Task {
     pid: Option<Pid>,
     path_to_binary: String,
     args: Option<Vec<String>>,
-    duration: u64,
+    duration: f64,
     state: ProcessState,
     priority: u8,
     space: ProcessSpace,
     exit_code: Option<ExitCode>,
+    created: SystemTime,
 }
 
 impl Task {
@@ -68,18 +69,18 @@ impl Task {
             pid: None,
             path_to_binary: path_to_binary.to_owned(),
             args,
-            duration: 0,
+            duration: 0.0,
             state: ProcessState::New,
             priority,
             space,
             exit_code: None,
+            created: SystemTime::now(),
         }
     }
 
     fn run(&mut self, tx: mpsc::Sender<ExitStatus>) {
         if self.pid.is_none() {
             self.state = ProcessState::Running;
-            let start_time = Instant::now();
 
             let mut command = Command::new(&self.path_to_binary);
 
@@ -92,8 +93,8 @@ impl Task {
                 Err(err) => {
                     self.exit_code = Some(ExitCode::Failure);
                     self.state = ProcessState::Terminated;
-                    let elapsed = start_time.elapsed();
-                    self.duration += elapsed.as_millis() as u64;
+                    let now = SystemTime::now();
+                    self.duration += now.duration_since(self.created).unwrap().as_secs_f64();
 
                     print_state(
                         self.id,
@@ -121,23 +122,21 @@ impl Task {
                     }
 
                     self.state = ProcessState::Terminated;
-                    let elapsed = start_time.elapsed();
-                    self.duration += elapsed.as_millis() as u64;
+                    let now = SystemTime::now();
+                    self.duration += now.duration_since(self.created).unwrap().as_secs_f64();
                     print_state(self.id, &self.state, self.exit_code, self.duration, None);
                     return;
                 }
                 Ok(None) => {
                     self.state = ProcessState::Running;
-                    let elapsed = start_time.elapsed();
-                    self.duration += elapsed.as_millis() as u64;
-                    print_state(self.id, &self.state, self.exit_code, self.duration, None);
+                    print_state(self.id, &self.state, None, self.duration, None);
                     tx.send(ExitStatus::Running).unwrap();
                     self.pause();
                     return;
                 }
                 Err(err) => {
-                    let elapsed = start_time.elapsed();
-                    self.duration += elapsed.as_millis() as u64;
+                    let now = SystemTime::now();
+                    self.duration += now.duration_since(self.created).unwrap().as_secs_f64();
                     self.exit_code = Some(ExitCode::Failure);
                     self.state = ProcessState::Terminated;
                     print_state(
@@ -153,7 +152,6 @@ impl Task {
                 }
             }
         } else {
-            // Duration is NOT being track here...
             self.resume();
         }
     }
@@ -195,7 +193,7 @@ fn print_state(
     id: Ulid,
     state: &ProcessState,
     exit_code: Option<ExitCode>,
-    duration: u64,
+    duration: f64,
     err: Option<&dyn Error>,
 ) {
     if *state == ProcessState::Ready
@@ -232,7 +230,7 @@ fn print_state(
              PID:            {}\n\
              State:          {:?}\n\
              Exit Code:      {}\n\
-             Duration:       {}ms\n\
+             Duration:       {} seconds\n\
              ------------------------------------------",
             id, state, exit_code_str, duration,
         );
@@ -313,14 +311,23 @@ fn main() {
                                 task.exit_code = Some(ExitCode::Failure);
                             }
 
+                            let now = SystemTime::now();
+                            task.duration +=
+                                now.duration_since(task.created).unwrap().as_secs_f64();
                             task.state = ProcessState::Terminated;
                             print_state(task.id, &task.state, task.exit_code, task.duration, None);
                         }
                         Ok(_) => {
+                            let now = SystemTime::now();
+                            task.duration +=
+                                now.duration_since(task.created).unwrap().as_secs_f64();
                             task.state = ProcessState::Terminated;
                             print_state(task.id, &task.state, None, task.duration, None);
                         }
                         Err(err) => {
+                            let now = SystemTime::now();
+                            task.duration +=
+                                now.duration_since(task.created).unwrap().as_secs_f64();
                             task.state = ProcessState::Terminated;
                             print_state(task.id, &task.state, None, task.duration, Some(&err));
                         }
