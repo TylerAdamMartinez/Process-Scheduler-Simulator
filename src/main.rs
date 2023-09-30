@@ -1,3 +1,4 @@
+use nix::unistd::Pid;
 use std::error::Error;
 use std::process::Command;
 use std::sync::mpsc;
@@ -5,11 +6,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 use ulid::Ulid;
 
-const TIME_QUANTUM: u64 = 500;
+const TIME_QUANTUM: u64 = 150;
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 enum ExitStatus {
-    Pending,
+    Running,
     Terminated(ExitCode),
 }
 
@@ -17,7 +18,6 @@ enum ExitStatus {
 enum ExitCode {
     Success,
     Failure,
-    From(i32),
 }
 
 impl std::fmt::Display for ExitCode {
@@ -25,7 +25,6 @@ impl std::fmt::Display for ExitCode {
         match self {
             ExitCode::Success => write!(f, "0"),
             ExitCode::Failure => write!(f, "1"),
-            ExitCode::From(code) => write!(f, "{}", code),
         }
     }
 }
@@ -47,6 +46,7 @@ enum ProcessSpace {
 
 struct Task {
     id: Ulid,
+    pid: Option<Pid>,
     path_to_binary: String,
     args: Option<Vec<String>>,
     duration: u64,
@@ -65,6 +65,7 @@ impl Task {
     ) -> Self {
         Self {
             id: Ulid::new(),
+            pid: None,
             path_to_binary: path_to_binary.to_owned(),
             args,
             duration: 0,
@@ -75,72 +76,117 @@ impl Task {
         }
     }
 
-    fn run(&mut self, quantum: u64, tx: mpsc::Sender<ExitStatus>) {
-        self.state = ProcessState::Running;
-        print_state(self.id, &self.state, self.exit_code, self.duration, None);
+    fn run(&mut self, tx: mpsc::Sender<ExitStatus>) {
+        if self.pid.is_none() {
+            self.state = ProcessState::Running;
+            let start_time = Instant::now();
 
-        let run_time = std::cmp::min(self.duration, quantum);
-        self.duration -= run_time;
+            let mut command = Command::new(&self.path_to_binary);
 
-        let start_time = Instant::now();
-
-        let mut command = Command::new(&self.path_to_binary);
-
-        if let Some(arguments) = &self.args {
-            command.args(arguments);
-        }
-
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                let elapsed = start_time.elapsed();
-                self.duration += elapsed.as_millis() as u64;
-                self.exit_code = Some(ExitCode::Failure);
-                self.state = ProcessState::Terminated;
-                print_state(
-                    self.id,
-                    &self.state,
-                    self.exit_code,
-                    self.duration,
-                    Some(&err),
-                );
-
-                tx.send(ExitStatus::Terminated(ExitCode::Failure)).unwrap();
-                return;
+            if let Some(arguments) = &self.args {
+                command.args(arguments);
             }
-        };
-        let exit_status = match child.wait() {
-            Ok(exit_status) => exit_status,
-            Err(err) => {
-                let elapsed = start_time.elapsed();
-                self.duration += elapsed.as_millis() as u64;
-                self.exit_code = Some(ExitCode::Failure);
-                self.state = ProcessState::Terminated;
-                print_state(
-                    self.id,
-                    &self.state,
-                    self.exit_code,
-                    self.duration,
-                    Some(&err),
-                );
 
-                tx.send(ExitStatus::Terminated(ExitCode::Failure)).unwrap();
-                return;
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(err) => {
+                    self.exit_code = Some(ExitCode::Failure);
+                    self.state = ProcessState::Terminated;
+                    let elapsed = start_time.elapsed();
+                    self.duration += elapsed.as_millis() as u64;
+
+                    print_state(
+                        self.id,
+                        &self.state,
+                        Some(ExitCode::Failure),
+                        self.duration,
+                        Some(&err),
+                    );
+
+                    tx.send(ExitStatus::Terminated(ExitCode::Failure)).unwrap();
+                    return;
+                }
+            };
+
+            self.pid = Some(Pid::from_raw(child.id() as i32));
+
+            match child.try_wait() {
+                Ok(Some(exit_status)) => {
+                    if exit_status.success() {
+                        self.exit_code = Some(ExitCode::Success);
+                        tx.send(ExitStatus::Terminated(ExitCode::Success)).unwrap();
+                    } else {
+                        self.exit_code = Some(ExitCode::Failure);
+                        tx.send(ExitStatus::Terminated(ExitCode::Failure)).unwrap();
+                    }
+
+                    self.state = ProcessState::Terminated;
+                    let elapsed = start_time.elapsed();
+                    self.duration += elapsed.as_millis() as u64;
+                    print_state(self.id, &self.state, self.exit_code, self.duration, None);
+                    return;
+                }
+                Ok(None) => {
+                    self.state = ProcessState::Running;
+                    let elapsed = start_time.elapsed();
+                    self.duration += elapsed.as_millis() as u64;
+                    print_state(self.id, &self.state, self.exit_code, self.duration, None);
+                    tx.send(ExitStatus::Running).unwrap();
+                    self.pause();
+                    return;
+                }
+                Err(err) => {
+                    let elapsed = start_time.elapsed();
+                    self.duration += elapsed.as_millis() as u64;
+                    self.exit_code = Some(ExitCode::Failure);
+                    self.state = ProcessState::Terminated;
+                    print_state(
+                        self.id,
+                        &self.state,
+                        self.exit_code,
+                        self.duration,
+                        Some(&err),
+                    );
+
+                    tx.send(ExitStatus::Terminated(ExitCode::Failure)).unwrap();
+                    return;
+                }
             }
-        };
-
-        let elapsed = start_time.elapsed();
-        self.duration += elapsed.as_millis() as u64;
-
-        tx.send(ExitStatus::Terminated(ExitCode::Success)).unwrap();
-
-        if exit_status.success() {
-            self.exit_code = Some(ExitCode::Success);
-            self.state = ProcessState::Terminated;
-            print_state(self.id, &self.state, self.exit_code, self.duration, None);
         } else {
+            // Duration is NOT being track here...
+            self.resume();
+        }
+    }
+
+    fn pause(&mut self) {
+        if let Some(pid) = self.pid {
+            nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGSTOP).unwrap();
+
             self.state = ProcessState::Waiting;
-            print_state(self.id, &self.state, self.exit_code, self.duration, None);
+            println!(
+                "------------------------------------------\n\
+                 PAUSED\n\
+                 PID:            {}\n\
+                 State:          {:?}\n\
+                 ------------------------------------------",
+                self.id, self.state,
+            );
+        }
+    }
+
+    fn resume(&mut self) {
+        if let Some(pid) = self.pid {
+            nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGCONT).unwrap();
+
+            self.state = ProcessState::Running;
+            println!(
+                "------------------------------------------\n\
+                 RESUMED\n\
+                 PID:            {}\n\
+                 State:          {:?}\n\
+                 ------------------------------------------",
+                self.id, self.state,
+            );
         }
     }
 }
@@ -152,7 +198,10 @@ fn print_state(
     duration: u64,
     err: Option<&dyn Error>,
 ) {
-    if *state == ProcessState::Ready || *state == ProcessState::Running {
+    if *state == ProcessState::Ready
+        || *state == ProcessState::Running
+        || *state == ProcessState::Waiting
+    {
         println!(
             "------------------------------------------\n\
              PID:            {}\n\
@@ -189,8 +238,9 @@ fn print_state(
         );
     };
 }
+
 fn dispatcher(tasks: &mut Vec<Task>, tx: &mpsc::Sender<ExitStatus>) {
-    for task in &mut *tasks {
+    for task in tasks.iter_mut() {
         if task.state == ProcessState::Waiting {
             task.state = ProcessState::Ready;
         }
@@ -205,11 +255,16 @@ fn dispatcher(tasks: &mut Vec<Task>, tx: &mpsc::Sender<ExitStatus>) {
             "Dispatcher selected PID: {} with priority: {}",
             task.id, task.priority
         );
-        task.run(TIME_QUANTUM, mpsc::Sender::clone(tx));
+        task.run(mpsc::Sender::clone(tx));
     }
 }
 
 fn main() {
+    if !cfg!(unix) {
+        println!("This program only runs on UNIX-like operating systems.");
+        std::process::exit(1);
+    }
+
     let (tx, rx) = mpsc::channel();
 
     let mut tasks = vec![
@@ -241,9 +296,39 @@ fn main() {
     loop {
         let mut all_done = true;
 
-        for task in &tasks {
+        dispatcher(&mut tasks, &tx);
+        thread::sleep(Duration::from_millis(TIME_QUANTUM));
+
+        for task in &mut tasks {
+            if task.state == ProcessState::Running {
+                if let Some(pid) = task.pid {
+                    match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                        Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+                            task.pause();
+                        }
+                        Ok(nix::sys::wait::WaitStatus::Exited(_pid, exit_code)) => {
+                            if exit_code == 0 {
+                                task.exit_code = Some(ExitCode::Success);
+                            } else {
+                                task.exit_code = Some(ExitCode::Failure);
+                            }
+
+                            task.state = ProcessState::Terminated;
+                            print_state(task.id, &task.state, task.exit_code, task.duration, None);
+                        }
+                        Ok(_) => {
+                            task.state = ProcessState::Terminated;
+                            print_state(task.id, &task.state, None, task.duration, None);
+                        }
+                        Err(err) => {
+                            task.state = ProcessState::Terminated;
+                            print_state(task.id, &task.state, None, task.duration, Some(&err));
+                        }
+                    }
+                }
+            }
+
             if task.state != ProcessState::Terminated {
-                print_state(task.id, &task.state, task.exit_code, task.duration, None);
                 all_done = false;
             }
         }
@@ -251,9 +336,6 @@ fn main() {
         if all_done {
             break;
         }
-
-        dispatcher(&mut tasks, &tx);
-        thread::sleep(Duration::from_millis(TIME_QUANTUM));
     }
 
     for _ in 0..tasks.len() {
