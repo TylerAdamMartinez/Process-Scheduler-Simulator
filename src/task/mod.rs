@@ -7,7 +7,7 @@ use std::time::SystemTime;
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq, Copy, Clone)]
-pub enum ExitStatus {
+pub enum Status {
     Running,
     Terminated(ExitCode),
 }
@@ -52,14 +52,6 @@ impl std::fmt::Display for State {
 pub enum Space {
     User,
     Kernal,
-}
-
-pub struct TaskInfo(Option<Pid>, Ulid);
-
-impl std::fmt::Display for TaskInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.1)
-    }
 }
 
 pub struct Task<'a> {
@@ -109,7 +101,7 @@ impl<'a> Task<'a> {
         self.created
     }
 
-    pub fn run(&mut self, tx: mpsc::Sender<ExitStatus>) {
+    pub fn run(&mut self, tx: mpsc::Sender<Status>) {
         if self.pid.is_none() {
             self.state = State::Running;
 
@@ -129,7 +121,7 @@ impl<'a> Task<'a> {
 
                     self.print_with_error(&err);
 
-                    tx.send(ExitStatus::Terminated(ExitCode::Failure)).unwrap();
+                    tx.send(Status::Terminated(ExitCode::Failure)).unwrap();
                     return;
                 }
             };
@@ -140,10 +132,10 @@ impl<'a> Task<'a> {
                 Ok(Some(exit_status)) => {
                     if exit_status.success() {
                         self.exit_code = Some(ExitCode::Success);
-                        tx.send(ExitStatus::Terminated(ExitCode::Success)).unwrap();
+                        tx.send(Status::Terminated(ExitCode::Success)).unwrap();
                     } else {
                         self.exit_code = Some(ExitCode::Failure);
-                        tx.send(ExitStatus::Terminated(ExitCode::Failure)).unwrap();
+                        tx.send(Status::Terminated(ExitCode::Failure)).unwrap();
                     }
 
                     self.state = State::Terminated;
@@ -155,7 +147,7 @@ impl<'a> Task<'a> {
                 Ok(None) => {
                     self.state = State::Running;
                     self.print();
-                    tx.send(ExitStatus::Running).unwrap();
+                    tx.send(Status::Running).unwrap();
                     self.pause();
                     return;
                 }
@@ -166,7 +158,7 @@ impl<'a> Task<'a> {
                     self.state = State::Terminated;
                     self.print_with_error(&err);
 
-                    tx.send(ExitStatus::Terminated(ExitCode::Failure)).unwrap();
+                    tx.send(Status::Terminated(ExitCode::Failure)).unwrap();
                     return;
                 }
             }
@@ -255,18 +247,18 @@ impl<'a> Task<'a> {
         );
     }
 
-    pub fn get_current_state(&self) -> Result<ExitStatus, nix::errno::Errno> {
+    pub fn get_current_state(&self) -> Result<Status, nix::errno::Errno> {
         if let Some(pid) = self.pid {
             match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
-                Ok(nix::sys::wait::WaitStatus::StillAlive) => Ok(ExitStatus::Running),
+                Ok(nix::sys::wait::WaitStatus::StillAlive) => Ok(Status::Running),
                 Ok(nix::sys::wait::WaitStatus::Exited(_, exit_code)) => {
                     if exit_code == 0 {
-                        return Ok(ExitStatus::Terminated(ExitCode::Success));
+                        return Ok(Status::Terminated(ExitCode::Success));
                     } else {
-                        return Ok(ExitStatus::Terminated(ExitCode::Failure));
+                        return Ok(Status::Terminated(ExitCode::Failure));
                     }
                 }
-                Ok(_) => Ok(ExitStatus::Terminated(ExitCode::Failure)),
+                Ok(_) => Ok(Status::Terminated(ExitCode::Failure)),
                 Err(err) => Err(err),
             }
         } else {

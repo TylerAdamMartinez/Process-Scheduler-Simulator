@@ -6,7 +6,7 @@ mod task;
 
 const TIME_QUANTUM: u64 = 150;
 
-fn dispatcher(tasks: &mut Vec<Task>, tx: &mpsc::Sender<task::ExitStatus>) {
+fn dispatcher(tasks: &mut Vec<Task>, tx: &mpsc::Sender<task::Status>) {
     for task in tasks.iter_mut() {
         if task.state == task::State::Waiting {
             task.state = task::State::Ready;
@@ -72,36 +72,37 @@ fn main() {
         for task in &mut tasks {
             if task.state == task::State::Running {
                 match task.get_current_state() {
-                    Ok(task::ExitStatus::Running) => {
+                    Ok(task::Status::Running) => {
                         task.pause();
                     }
-                    Ok(task::ExitStatus::Terminated(task::ExitCode::Success)) => {
+                    Ok(task::Status::Terminated(task::ExitCode::Success)) => {
+                        task.state = task::State::Terminated;
                         task.exit_code = Some(task::ExitCode::Success);
                         let now = SystemTime::now();
                         task.duration += now
                             .duration_since(task.get_date_time_created())
                             .unwrap()
                             .as_secs_f64();
-                        task.state = task::State::Terminated;
                         task.print();
                     }
-                    Ok(task::ExitStatus::Terminated(task::ExitCode::Failure)) => {
+                    Ok(task::Status::Terminated(task::ExitCode::Failure)) => {
+                        task.state = task::State::Terminated;
                         task.exit_code = Some(task::ExitCode::Failure);
                         let now = SystemTime::now();
                         task.duration += now
                             .duration_since(task.get_date_time_created())
                             .unwrap()
                             .as_secs_f64();
-                        task.state = task::State::Terminated;
                         task.print();
                     }
                     Err(err) => {
+                        task.state = task::State::Terminated;
+                        task.exit_code = Some(task::ExitCode::Failure);
                         let now = SystemTime::now();
                         task.duration += now
                             .duration_since(task.get_date_time_created())
                             .unwrap()
                             .as_secs_f64();
-                        task.state = task::State::Terminated;
                         task.print_with_error(&err);
                     }
                 }
