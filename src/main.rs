@@ -36,29 +36,18 @@ fn main() {
     let (tx, rx) = mpsc::channel();
 
     let mut tasks = vec![
-        Task::new("/bin/ls".as_ref(), None, task::Space::Kernal, 3),
-        Task::new(
-            "/bin/cat".as_ref(),
-            Some(Vec::from(["src/main.rs"])),
-            task::Space::User,
-            1,
-        ),
-        Task::new(
-            "/bin/echo".as_ref(),
-            Some(Vec::from(["Howdy Y'all!"])),
-            task::Space::User,
-            2,
-        ),
-        Task::new("/bin/ls".as_ref(), None, task::Space::Kernal, 5),
-        Task::new("/bad/path/to/ls".as_ref(), None, task::Space::User, 4),
+        Task::new("/bad/path".as_ref(), None, 4),
+        Task::new("/bin/echo".as_ref(), Some(Vec::from(["Howdy Y'all!"])), 2),
+        Task::new("/bin/ls".as_ref(), None, 5),
+        Task::new("/bin/cat".as_ref(), Some(Vec::from(["src/main.rs"])), 1),
+        Task::new("/bin/ls".as_ref(), None, 3),
     ];
 
     for task in &mut tasks {
         println!(
-            "Created PID: {} with priority: {} in space: {:?}",
+            "Created PID: {} with priority: {}",
             task.get_id(),
             task.priority,
-            task.get_space(),
         );
         task.state = task::State::Ready;
     }

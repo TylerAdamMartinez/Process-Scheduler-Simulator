@@ -48,12 +48,6 @@ impl std::fmt::Display for State {
     }
 }
 
-#[derive(Debug, PartialEq, Copy, Clone)]
-pub enum Space {
-    User,
-    Kernal,
-}
-
 pub struct Task<'a> {
     pub state: State,
     pub duration: f64,
@@ -65,16 +59,10 @@ pub struct Task<'a> {
     path_to_binary: &'a OsStr,
     args: Option<Vec<&'a str>>,
     created: SystemTime,
-    space: Space,
 }
 
 impl<'a> Task<'a> {
-    pub fn new(
-        path_to_binary: &'a OsStr,
-        args: Option<Vec<&'a str>>,
-        space: Space,
-        priority: u8,
-    ) -> Self {
+    pub fn new(path_to_binary: &'a OsStr, args: Option<Vec<&'a str>>, priority: u8) -> Self {
         Self {
             id: Ulid::new(),
             pid: None,
@@ -83,7 +71,6 @@ impl<'a> Task<'a> {
             duration: 0.0,
             state: State::New,
             priority,
-            space,
             exit_code: None,
             created: SystemTime::now(),
         }
@@ -91,10 +78,6 @@ impl<'a> Task<'a> {
 
     pub fn get_id(&self) -> Ulid {
         self.id
-    }
-
-    pub fn get_space(&self) -> Space {
-        self.space
     }
 
     pub fn get_date_time_created(&self) -> SystemTime {
