@@ -1,105 +1,103 @@
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
-use ulid::Ulid;
+use std::time::{Duration, SystemTime};
+use task::Task;
+mod task;
 
-const TIME_QUANTUM: u64 = 500; 
+const TIME_QUANTUM: u64 = 150;
 
-#[derive(Debug, PartialEq)]
-enum ProcessState {
-    New,
-    Ready,
-    Running,
-    Waiting,
-    Terminated,
-}
-
-#[derive(Debug, PartialEq)]
-enum ProcessSpace {
-    User,
-    Kernal,
-}
-
-struct Task {
-    id: Ulid,
-    duration: u64,
-    state: ProcessState,
-    priority: u8,
-    space: ProcessSpace,
-    aged: bool,
-}
-
-impl Task {
-    fn new(duration: u64, space: ProcessSpace, priority: u8) -> Self {
-        Self {
-            id: Ulid::new(),
-            duration,
-            state: ProcessState::New,
-            priority,
-            space,
-            aged: false,
+fn dispatcher(tasks: &mut Vec<Task>, tx: &mpsc::Sender<task::Status>) {
+    for task in tasks.iter_mut() {
+        if task.state == task::State::Waiting {
+            task.state = task::State::Ready;
         }
     }
 
-    fn run(&mut self, quantum: u64, tx: mpsc::Sender<usize>) {
-        self.state = ProcessState::Running;
-        println!("PID: {} transitioned to {:?}", self.id, self.state);
-
-        let run_time = std::cmp::min(self.duration, quantum);
-        self.duration -= run_time;
-
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(run_time));
-            tx.send(run_time as usize).unwrap();
-        });
-        
-        if self.duration == 0 {
-            self.state = ProcessState::Terminated;
-            println!("PID: {} transitioned to {:?}", self.id, self.state);
-        } else {
-            self.state = ProcessState::Waiting;
-            self.aged = true;
-            println!("PID: {} transitioned to {:?}", self.id, self.state);
-        }
-    }
-}
-
-fn dispatcher(tasks: &mut Vec<Task>, tx: &mpsc::Sender<usize>) {
-    for task in &mut *tasks {
-        if task.aged && task.state == ProcessState::Waiting {
-            task.state = ProcessState::Ready;
-        }
-    }
-
-    if let Some(task) = tasks.iter_mut().filter(|t| t.state == ProcessState::Ready).min_by_key(|t| t.priority) {
-        println!("Dispatcher selected PID: {} with priority: {}", task.id, task.priority);
-        task.run(TIME_QUANTUM, mpsc::Sender::clone(tx));
+    if let Some(task) = tasks
+        .iter_mut()
+        .filter(|t| t.state == task::State::Ready)
+        .min_by_key(|t| t.priority)
+    {
+        println!(
+            "Dispatcher selected PID: {} with priority: {}",
+            task.get_id(),
+            task.priority
+        );
+        task.run(mpsc::Sender::clone(tx));
     }
 }
 
 fn main() {
+    if !cfg!(unix) {
+        println!("This program only runs on UNIX-like operating systems.");
+        std::process::exit(1);
+    }
+
     let (tx, rx) = mpsc::channel();
 
     let mut tasks = vec![
-        Task::new(100, ProcessSpace::Kernal, 3),
-        Task::new(600, ProcessSpace::User, 1),
-        Task::new(300, ProcessSpace::User, 2),
-        Task::new(800, ProcessSpace::Kernal, 5),
-        Task::new(50, ProcessSpace::User, 4),
+        Task::new("/bad/path".as_ref(), None, 4),
+        Task::new("/bin/echo".as_ref(), Some(Vec::from(["Howdy Y'all!"])), 2),
+        Task::new("/bin/ls".as_ref(), None, 5),
+        Task::new("/bin/cat".as_ref(), Some(Vec::from(["src/main.rs"])), 1),
+        Task::new("/bin/ls".as_ref(), None, 3),
     ];
-   
+
     for task in &mut tasks {
-        println!("Created PID: {} with priority: {}, duration: {}ms, in space: {:?}", task.id, task.priority, task.duration, task.space);
-        task.state = ProcessState::Ready;
-        println!("PID: {} transitioned to {:?}", task.id, task.state);
+        println!(
+            "Created PID: {} with priority: {}",
+            task.get_id(),
+            task.priority,
+        );
+        task.state = task::State::Ready;
     }
 
     loop {
         let mut all_done = true;
 
-        for task in &tasks {
-            if task.state != ProcessState::Terminated {
-                println!("PID: {} is currently in state: {:?}", task.id, task.state);
+        dispatcher(&mut tasks, &tx);
+        thread::sleep(Duration::from_millis(TIME_QUANTUM));
+
+        for task in &mut tasks {
+            if task.state == task::State::Running {
+                match task.get_current_state() {
+                    Ok(task::Status::Running) => {
+                        task.pause();
+                    }
+                    Ok(task::Status::Terminated(task::ExitCode::Success)) => {
+                        task.state = task::State::Terminated;
+                        task.exit_code = Some(task::ExitCode::Success);
+                        let now = SystemTime::now();
+                        task.duration += now
+                            .duration_since(task.get_date_time_created())
+                            .unwrap()
+                            .as_secs_f64();
+                        task.print();
+                    }
+                    Ok(task::Status::Terminated(task::ExitCode::Failure)) => {
+                        task.state = task::State::Terminated;
+                        task.exit_code = Some(task::ExitCode::Failure);
+                        let now = SystemTime::now();
+                        task.duration += now
+                            .duration_since(task.get_date_time_created())
+                            .unwrap()
+                            .as_secs_f64();
+                        task.print();
+                    }
+                    Err(err) => {
+                        task.state = task::State::Terminated;
+                        task.exit_code = Some(task::ExitCode::Failure);
+                        let now = SystemTime::now();
+                        task.duration += now
+                            .duration_since(task.get_date_time_created())
+                            .unwrap()
+                            .as_secs_f64();
+                        task.print_with_error(&err);
+                    }
+                }
+            }
+
+            if task.state != task::State::Terminated {
                 all_done = false;
             }
         }
@@ -107,9 +105,6 @@ fn main() {
         if all_done {
             break;
         }
-
-        dispatcher(&mut tasks, &tx);
-        thread::sleep(Duration::from_millis(TIME_QUANTUM));
     }
 
     for _ in 0..tasks.len() {
